@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const { Buffer } = require('buffer');
 const { exec, execSync } = require('child_process');
 const { WebSocket, createWebSocketStream } = require('ws');
-const UUID = process.env.UUID || '5efabea4-f6d4-91fd-b8f0-17e004c89c60'; // 运行哪吒v1,在不同的平台需要改UUID,否则会被覆盖
+const UUID = process.env.UUID || ''; // 运行哪吒v1,在不同的平台需要改UUID,否则会被覆盖
 const NEZHA_SERVER = process.env.NEZHA_SERVER || '';       // 哪吒v1填写形式：nz.abc.com:8008   哪吒v0填写形式：nz.abc.com
 const NEZHA_PORT = process.env.NEZHA_PORT || '';           // 哪吒v1没有此变量，v0的agent端口为{443,8443,2096,2087,2083,2053}其中之一时开启tls
 const NEZHA_KEY = process.env.NEZHA_KEY || '';             // v1的NZ_CLIENT_SECRET或v0的agent端口                
@@ -105,35 +105,78 @@ function resolveHost(host) {
 }
 
 // VLE-SS处理
+// 修复后的 VLESS 处理函数
 function handleVlessConnection(ws, msg) {
-  const [VERSION] = msg;
-  const id = msg.slice(1, 17);
-  if (!id.every((v, i) => v == parseInt(uuid.substr(i * 2, 2), 16))) return false;
-  
-  let i = msg.slice(17, 18).readUInt8() + 19;
-  const port = msg.slice(i, i += 2).readUInt16BE(0);
-  const ATYP = msg.slice(i, i += 1).readUInt8();
-  const host = ATYP == 1 ? msg.slice(i, i += 4).join('.') :
-    (ATYP == 2 ? new TextDecoder().decode(msg.slice(i + 1, i += 1 + msg.slice(i, i + 1).readUInt8())) :
-    (ATYP == 3 ? msg.slice(i, i += 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':') : ''));
-  ws.send(new Uint8Array([VERSION, 0]));
-  const duplex = createWebSocketStream(ws);
-  resolveHost(host)
-    .then(resolvedIP => {
-      net.connect({ host: resolvedIP, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
-    })
-    .catch(error => {
-      net.connect({ host, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
-    });
-  
-  return true;
+  try {
+    // 1. 基础长度校验，VLESS 头部最小长度通常不小于 24 字节
+    if (msg.length < 24) return false;
+
+    const [VERSION] = msg;
+    const id = msg.slice(1, 17);
+    if (!id.every((v, i) => v == parseInt(uuid.substr(i * 2, 2), 16))) return false;
+
+    // 获取附加信息长度 (optLength)
+    // 原代码: let i = msg.slice(17, 18).readUInt8() + 19;
+    const optLength = msg[17]; 
+    let i = optLength + 19;
+
+    // 2. 关键修复：在读取端口前，检查 Buffer 长度是否足够
+    // 端口占 2 字节，所以 i + 2 不能超过 msg.length
+    if (msg.length < i + 2) {
+      // console.log('VLESS Packet too short for port');
+      return false;
+    }
+
+    const port = msg.readUInt16BE(i);
+    i += 2;
+
+    // 检查 ATYP 字节是否存在
+    if (msg.length < i + 1) return false;
+    const ATYP = msg[i];
+    i += 1;
+
+    let host;
+    if (ATYP == 1) {
+      if (msg.length < i + 4) return false; // 校验 IPv4 长度
+      host = msg.slice(i, i += 4).join('.');
+    } else if (ATYP == 2) {
+      if (msg.length < i + 1) return false; // 校验域名长度字节
+      const domainLen = msg[i];
+      i += 1;
+      if (msg.length < i + domainLen) return false; // 校验域名内容长度
+      host = new TextDecoder().decode(msg.slice(i, i += domainLen));
+    } else if (ATYP == 3) {
+      if (msg.length < i + 16) return false; // 校验 IPv6 长度
+      host = msg.slice(i, i += 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':');
+    } else {
+      return '';
+    }
+
+    ws.send(new Uint8Array([VERSION, 0]));
+    const duplex = createWebSocketStream(ws);
+    
+    resolveHost(host)
+      .then(resolvedIP => {
+        const client = net.connect({ host: resolvedIP, port }, function() {
+          this.write(msg.slice(i));
+          duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
+        });
+        client.on('error', () => {
+            // 连接错误处理，防止崩溃
+        });
+      })
+      .catch(error => {
+        // DNS 解析失败或其他错误处理
+      });
+
+    return true;
+  } catch (err) {
+    // 捕获所有解析过程中的错误，防止进程退出
+    // console.error('VLESS handle error:', err);
+    return false;
+  }
 }
+
 
 // Tro-jan处理
 function handleTrojanConnection(ws, msg) {
@@ -341,37 +384,27 @@ uuid: ${UUID}`;
   }   
 }; 
 
-async function addAccessTask() {
-  if (!AUTO_ACCESS) return;
-
-  if (!DOMAIN) {
-    return;
-  }
-  const fullURL = `https://${DOMAIN}/${SUB_PATH}`;
-  try {
-    const res = await axios.post("https://oooo.serv00.net/add-url", {
-      url: fullURL
-    }, {
-      headers: {
-        'Content-Type': 'application/json'
-      }
-    });
-    console.log('Automatic Access Task added successfully');
-  } catch (error) {
-    // console.error('Error adding Task:', error.message);
-  }
-}
 
 const delFiles = () => {
   fs.unlink('npm', () => {});
   fs.unlink('config.yaml', () => {}); 
 };
 
+process.on('uncaughtException', (err) => {
+  console.error('Caught exception:', err);
+  // 不执行 exit，保持进程运行
+});
+
+process.on('unhandledRejection', (reason, p) => {
+  console.error('Unhandled Rejection at:', p, 'reason:', reason);
+  // 不执行 exit，保持进程运行
+});
+
 httpServer.listen(PORT, () => {
   runnz();
   setTimeout(() => {
     delFiles();
   }, 180000);
-  addAccessTask();
+  //addAccessTask();
   console.log(`Server is running on port ${PORT}`);
 });
